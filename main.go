@@ -15,24 +15,35 @@ import (
 	"google.golang.org/grpc"
 )
 
-type Groups []Group
 type Rules []Rule
 
 type Group struct {
-	uid   int    `json:"uid"`
-	rules string `json:"dgraph.group.acl"`
+	Uid   string `json:"uid"`
+	Rules string `json:"dgraph.group.acl,omitempty"`
 }
 
 type Rule struct {
-	predicate  string `json:"predicate"`
-	permission int    `json:"perm"`
+	Predicate  string `json:"predicate,omitempty"`
+	Permission int    `json:"perm,omitempty"`
 }
 
 func main() {
 	alpha := flag.String("alpha", "localhost:9180", "Alpha end point")
 	userName := flag.String("username", "", "Username")
 	password := flag.String("password", "", "Password")
+	outFile := flag.String("output", "acl_rules.rdf", "Write output to a file instead of stdout")
 	flag.Parse()
+
+	if _, err := os.Stat(*outFile); err == nil {
+		fmt.Println("Output file already exists.")
+		os.Exit(1)
+	}
+
+	f, err := os.OpenFile(*outFile, os.O_WRONLY|os.O_CREATE, 0666)
+	if err != nil {
+		fmt.Errorf("Error writing output file %s", outFile)
+		os.Exit(1)
+	}
 
 	conn, err := grpc.Dial(*alpha, grpc.WithInsecure())
 	x.Check(err)
@@ -57,27 +68,37 @@ func main() {
 	x.Check(err)
 
 	var buf bytes.Buffer
-	data := make(map[string]Groups)
+	data := make(map[string][]Group)
 	err = json.Unmarshal(resp.GetJson(), &data)
 	x.Check(err)
+
 	groups, ok := data["me"]
 	if !ok {
 		fmt.Errorf("Unable to parse ACLs: %+v", string(resp.GetJson()))
 		os.Exit(1)
 	}
 
+	ruleString := `<%s> <dgraph.acl.rule> _:newrule%[2]d .
+_:newrule%[2]d <dgraph.rule.predicate> "%s" .
+_:newrule%[2]d <dgraph.rule.permission> "%[4]d" .
+`
+
+	ruleCount := 1
 	for _, group := range groups {
 		var rules Rules
-		ruleCount := 1
-		fmt.Println(group)
-		err = json.Unmarshal([]byte(group.rules), &rules)
+		if group.Rules == "" {
+			continue
+		}
+
+		err = json.Unmarshal([]byte(group.Rules), &rules)
 		x.Check(err)
 		for _, rule := range rules {
-			newRule := fmt.Sprintf(`%s <dgraph.acl.rules> _:newrule%[2]d\n_:newrule%[2]d <dgraph.rule.predicate> %s\n_:newrule%[2]d <dgraph.rule.permission> %d`, group.uid, ruleCount, rule.predicate, rule.permission)
+			newRule := fmt.Sprintf(ruleString, group.Uid, ruleCount,
+				rule.Predicate, rule.Permission)
 			buf.WriteString(newRule)
 			ruleCount++
 		}
 	}
 
-	fmt.Println(buf.String())
+	fmt.Fprintln(f, buf.String())
 }
