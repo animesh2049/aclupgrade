@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -28,22 +27,11 @@ type Rule struct {
 }
 
 func main() {
-	alpha := flag.String("alpha", "localhost:9180", "Alpha end point")
-	userName := flag.String("username", "", "Username")
-	password := flag.String("password", "", "Password")
-	outFile := flag.String("output", "acl_rules.rdf", "Write output to a file instead of stdout")
+	alpha := flag.String("a", "localhost:9180", "Alpha end point")
+	userName := flag.String("u", "", "Username")
+	password := flag.String("p", "", "Password")
+	deleteOld := flag.Bool("d", false, "Delete the older ACL predicate.")
 	flag.Parse()
-
-	if _, err := os.Stat(*outFile); err == nil {
-		fmt.Println("Output file already exists.")
-		os.Exit(1)
-	}
-
-	f, err := os.OpenFile(*outFile, os.O_WRONLY|os.O_CREATE, 0666)
-	if err != nil {
-		fmt.Errorf("Error writing output file %s", outFile)
-		os.Exit(1)
-	}
 
 	conn, err := grpc.Dial(*alpha, grpc.WithInsecure())
 	x.Check(err)
@@ -67,7 +55,6 @@ func main() {
 	resp, err := dg.NewReadOnlyTxn().Query(ctx, query)
 	x.Check(err)
 
-	var buf bytes.Buffer
 	data := make(map[string][]Group)
 	err = json.Unmarshal(resp.GetJson(), &data)
 	x.Check(err)
@@ -78,12 +65,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	ruleString := `<%s> <dgraph.acl.rule> _:newrule%[2]d .
-_:newrule%[2]d <dgraph.rule.predicate> "%s" .
-_:newrule%[2]d <dgraph.rule.permission> "%[4]d" .
-`
-
 	ruleCount := 1
+	var nquads []*api.NQuad
 	for _, group := range groups {
 		var rules Rules
 		if group.Rules == "" {
@@ -93,12 +76,65 @@ _:newrule%[2]d <dgraph.rule.permission> "%[4]d" .
 		err = json.Unmarshal([]byte(group.Rules), &rules)
 		x.Check(err)
 		for _, rule := range rules {
-			newRule := fmt.Sprintf(ruleString, group.Uid, ruleCount,
-				rule.Predicate, rule.Permission)
-			buf.WriteString(newRule)
+			newRuleStr := fmt.Sprintf("_:newrule%d", ruleCount)
+			nquads = append(nquads, &api.NQuad{
+				Subject:   newRuleStr,
+				Predicate: "dgraph.rule.predicate",
+				ObjectValue: &api.Value{
+					Val: &api.Value_StrVal{StrVal: rule.Predicate},
+				},
+			})
+			nquads = append(nquads, &api.NQuad{
+				Subject:   newRuleStr,
+				Predicate: "dgraph.rule.permission",
+				ObjectValue: &api.Value{
+					Val: &api.Value_IntVal{IntVal: int64(rule.Permission)},
+				},
+			})
+			nquads = append(nquads, &api.NQuad{
+				Subject:   group.Uid,
+				Predicate: "dgraph.acl.rule",
+				ObjectId:  newRuleStr,
+			})
+
 			ruleCount++
 		}
 	}
 
-	fmt.Fprintln(f, buf.String())
+	ctx, _ = context.WithTimeout(ctx, 5*time.Second)
+	if !mutateACL(ctx, &api.Mutation{Set: nquads, CommitNow: true}, dg, nquads) {
+		fmt.Println("Error Restoring ACL rules.")
+	}
+
+	ctx, _ = context.WithTimeout(ctx, 5*time.Second)
+	if *deleteOld {
+		err = dg.Alter(ctx, &api.Operation{
+			DropOp:    api.Operation_ATTR,
+			DropValue: "dgraph.group.acl",
+		})
+		if err != nil {
+			fmt.Println(err)
+			fmt.Println("Error deleting old acl predicate.")
+		}
+	}
+}
+
+func mutateACL(ctx context.Context, mutation *api.Mutation, dg *dgo.Dgraph,
+	nquads []*api.NQuad) bool {
+	var err error
+	for i := 0; i < 3; i++ {
+		_, err := dg.NewTxn().Mutate(ctx, &api.Mutation{
+			Set:       nquads,
+			CommitNow: true,
+		})
+
+		if err != nil {
+			continue
+		}
+		fmt.Println("Successfully restored ACL rules.")
+		return true
+	}
+
+	fmt.Println(err)
+	return false
 }
